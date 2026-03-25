@@ -35,24 +35,72 @@ class Af1c1onados(object):
         if config.updateevery:
             schedule(config.updateevery * 60, self.Playlistparser)
 
+    def _normalize_playlist_url(self, url):
+        parsed = urlparse(url)
+        if parsed.netloc == 'github.com' and '/blob/' in parsed.path:
+            return 'https://raw.githubusercontent.com%s' % parsed.path.replace('/blob/', '/', 1)
+        return url
+
+    def _fetch_playlist_data(self, url):
+        normalized_url = self._normalize_playlist_url(url)
+        self.logger.info('Fetching playlist from %s' % normalized_url)
+        response = requests.get(normalized_url, headers=self.headers, proxies=config.proxies, timeout=30)
+        redirected_url = self._normalize_playlist_url(response.url)
+        if redirected_url != response.url and redirected_url != normalized_url:
+            self.logger.info('Refetching redirected playlist from %s' % redirected_url)
+            response = requests.get(redirected_url, headers=self.headers, proxies=config.proxies, timeout=30)
+            normalized_url = redirected_url
+        response.raise_for_status()
+        return response.json(), normalized_url
+
+    def _collect_station_groups(self, data, visited=None, fallback_group=None):
+        if visited is None:
+            visited = set()
+
+        station_groups = []
+        stations = data.get('stations', [])
+        if stations:
+            station_groups.append((data.get('name') or fallback_group or 'Others', stations))
+
+        for group in data.get('groups', []):
+            group_name = group.get('name') or fallback_group or 'Others'
+            stations = group.get('stations', [])
+            if stations:
+                station_groups.append((group_name, stations))
+                continue
+
+            group_url = group.get('url')
+            if not group_url:
+                continue
+
+            normalized_url = self._normalize_playlist_url(group_url)
+            if normalized_url in visited:
+                self.logger.warning('Skipping already fetched playlist %s' % normalized_url)
+                continue
+
+            try:
+                group_data, fetched_url = self._fetch_playlist_data(group_url)
+            except Exception as e:
+                self.logger.error('Error fetching subgroup %s from %s: %s' % (group_name, normalized_url, repr(e)))
+                continue
+
+            visited.add(normalized_url)
+            visited.add(fetched_url)
+            station_groups.extend(self._collect_station_groups(group_data, visited=visited, fallback_group=group_name))
+
+        return station_groups
+
     def Playlistparser(self):
         try:
-            self.logger.info('Fetching playlist from %s' % config.url)
-            r = requests.get(config.url, headers=self.headers, proxies=config.proxies, timeout=30)
-            r.raise_for_status()
-            
-            data = r.json()
-            
+            data, normalized_url = self._fetch_playlist_data(config.url)
+            station_groups = self._collect_station_groups(data, visited=set([normalized_url]))
+
             self.playlist = PlaylistGenerator(m3uchanneltemplate=config.m3uchanneltemplate)
             self.picons = {}
             self.channels = {}
             m = requests.auth.hashlib.md5()
-            
-            groups = data.get('groups', [])
-            for group in groups:
-                group_name = group.get('name', 'Others')
-                stations = group.get('stations', [])
-                
+
+            for group_name, stations in station_groups:
                 for station in stations:
                     name = station.get('name')
                     url = station.get('url')
@@ -85,7 +133,7 @@ class Af1c1onados(object):
             
             self.etag = '"' + m.hexdigest() + '"'
             self.playlisttime = time.time()
-            self.logger.info('Playlist updated: %d channels in %d groups' % (len(self.channels), len(groups)))
+            self.logger.info('Playlist updated: %d channels in %d groups' % (len(self.channels), len(station_groups)))
             return True
             
         except Exception as e:
