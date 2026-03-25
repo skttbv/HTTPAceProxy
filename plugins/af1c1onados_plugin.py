@@ -5,10 +5,13 @@ http://ip:port/af1c1onados
 '''
 __author__ = 'HTTPAceProxy'
 
+import difflib
+import re
 import requests
 import logging
 import traceback
 import time
+import unicodedata
 import zlib
 from urllib3.packages.six.moves.urllib.parse import urlparse, quote, unquote
 from urllib3.packages.six import ensure_str, ensure_binary, ensure_text
@@ -25,7 +28,15 @@ class Af1c1onados(object):
         self.AceProxy = AceProxy
         self.picons = self.channels = self.playlist = self.etag = None
         self.playlisttime = time.time()
-        self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        self.catalogindex = None
+        self.catalogindextime = 0
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
+        }
         self.logger = logging.getLogger('Af1c1onados')
         
         # Initial parse
@@ -36,14 +47,100 @@ class Af1c1onados(object):
             schedule(config.updateevery * 60, self.Playlistparser)
 
     def _normalize_playlist_url(self, url):
-        url = config.urlaliases.get(url, url)
         parsed = urlparse(url)
         if parsed.netloc == 'github.com' and '/blob/' in parsed.path:
             return 'https://raw.githubusercontent.com%s' % parsed.path.replace('/blob/', '/', 1)
         return url
 
-    def _fetch_playlist_data(self, url):
+    def _is_shortener_url(self, url):
+        return urlparse(url).netloc in ('cutt.ly', 'urlfy.org', 'n9.cl', 'smurl.es')
+
+    def _normalize_catalog_name(self, value, compact=False):
+        normalized = unicodedata.normalize('NFKD', ensure_text(value)).encode('ascii', 'ignore').decode('ascii').lower()
+        normalized = re.sub(r'^\d+(?:\.\d+)?\s*', '', normalized)
+        normalized = re.sub(r'\.w3u$', '', normalized)
+        normalized = normalized.replace('#', ' ')
+        aliases = {'m': 'movistar', 'tennis': 'tenis', 'us': 'usa'}
+        skip_tokens = ('sport', 'sports', 'tv', 'channel', 'hd', 'newloop') if compact else ()
+        tokens = []
+        for token in re.split(r'[^a-z0-9]+', normalized):
+            if not token:
+                continue
+            token = aliases.get(token, token)
+            if token in skip_tokens:
+                continue
+            tokens.append(token)
+        return ' '.join(tokens)
+
+    def _load_catalog_index(self):
+        if self.catalogindex and (time.time() - self.catalogindextime) < 3600:
+            return self.catalogindex
+
+        response = requests.get(config.catalogtreeurl, headers=self.headers, proxies=config.proxies, timeout=30)
+        response.raise_for_status()
+
+        catalogindex = []
+        for item in response.json().get('tree', []):
+            path = item.get('path')
+            if item.get('type') != 'blob' or not path or path == 'AcEStREAM iDs.w3u':
+                continue
+
+            catalogindex.append({
+                'path': path,
+                'url': 'https://raw.githubusercontent.com/af1Series1/Tritolgia/main/%s' % quote(ensure_str(path), '/'),
+                'strict': self._normalize_catalog_name(path),
+                'compact': self._normalize_catalog_name(path, compact=True)
+            })
+
+        self.catalogindex = catalogindex
+        self.catalogindextime = time.time()
+        return self.catalogindex
+
+    def _guess_catalog_url(self, group_name):
+        strict_name = self._normalize_catalog_name(group_name)
+        compact_name = self._normalize_catalog_name(group_name, compact=True)
+        best = second = (0, None)
+
+        for entry in self._load_catalog_index():
+            scores = []
+            if strict_name and entry['strict']:
+                scores.append(difflib.SequenceMatcher(None, strict_name, entry['strict']).ratio())
+            if compact_name and entry['compact']:
+                scores.append(difflib.SequenceMatcher(None, compact_name, entry['compact']).ratio())
+
+            score = max(scores) if scores else 0
+            if score > best[0]:
+                second = best
+                best = (score, entry)
+            elif score > second[0]:
+                second = (score, entry)
+
+        if best[0] >= 0.75 and (best[0] - second[0]) >= 0.05:
+            self.logger.warning('Resolved subgroup %s via catalog tree: %s' % (group_name, best[1]['path']))
+            return best[1]['url']
+        return None
+
+    def _resolve_shortener_url(self, url, group_name=None):
+        try:
+            response = requests.get(url, headers=self.headers, proxies=config.proxies, timeout=30, allow_redirects=False)
+            location = response.headers.get('Location')
+            if 300 <= response.status_code < 400 and location:
+                return self._normalize_playlist_url(location)
+        except Exception as e:
+            self.logger.warning('Shortener resolution failed for %s: %s' % (url, repr(e)))
+
+        if group_name:
+            guessed_url = self._guess_catalog_url(group_name)
+            if guessed_url:
+                return guessed_url
+
+        return self._normalize_playlist_url(url)
+
+    def _fetch_playlist_data(self, url, group_name=None):
         normalized_url = self._normalize_playlist_url(url)
+        if self._is_shortener_url(normalized_url):
+            normalized_url = self._resolve_shortener_url(normalized_url, group_name=group_name)
+
         self.logger.info('Fetching playlist from %s' % normalized_url)
         response = requests.get(normalized_url, headers=self.headers, proxies=config.proxies, timeout=30)
         redirected_url = self._normalize_playlist_url(response.url)
@@ -80,7 +177,7 @@ class Af1c1onados(object):
                 continue
 
             try:
-                group_data, fetched_url = self._fetch_playlist_data(group_url)
+                group_data, fetched_url = self._fetch_playlist_data(group_url, group_name=group_name)
             except Exception as e:
                 self.logger.error('Error fetching subgroup %s from %s: %s' % (group_name, normalized_url, repr(e)))
                 continue
