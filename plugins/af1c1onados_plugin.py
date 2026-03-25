@@ -36,6 +36,7 @@ class Af1c1onados(object):
             schedule(config.updateevery * 60, self.Playlistparser)
 
     def _normalize_playlist_url(self, url):
+        url = config.urlaliases.get(url, url)
         parsed = urlparse(url)
         if parsed.netloc == 'github.com' and '/blob/' in parsed.path:
             return 'https://raw.githubusercontent.com%s' % parsed.path.replace('/blob/', '/', 1)
