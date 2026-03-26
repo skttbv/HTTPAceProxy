@@ -53,7 +53,10 @@ class Af1c1onados(object):
         return url
 
     def _is_shortener_url(self, url):
-        return urlparse(url).netloc in ('cutt.ly', 'urlfy.org', 'n9.cl', 'smurl.es')
+        hostname = urlparse(url).netloc.lower()
+        if hostname.startswith('www.'):
+            hostname = hostname[4:]
+        return hostname in ('cutt.ly', 'urlfy.org', 'n9.cl', 'smurl.es')
 
     def _normalize_catalog_name(self, value, compact=False):
         normalized = unicodedata.normalize('NFKD', ensure_text(value)).encode('ascii', 'ignore').decode('ascii').lower()
@@ -122,10 +125,18 @@ class Af1c1onados(object):
 
     def _resolve_shortener_url(self, url, group_name=None):
         try:
-            response = requests.get(url, headers=self.headers, proxies=config.proxies, timeout=30, allow_redirects=False)
-            location = response.headers.get('Location')
-            if 300 <= response.status_code < 400 and location:
-                return self._normalize_playlist_url(location)
+            current_url = url
+            for _ in range(5):
+                response = requests.get(current_url, headers=self.headers, proxies=config.proxies, timeout=30, allow_redirects=False)
+                location = response.headers.get('Location')
+                if 300 <= response.status_code < 400 and location:
+                    current_url = self._normalize_playlist_url(location)
+                    if not self._is_shortener_url(current_url):
+                        return current_url
+                    continue
+                response.raise_for_status()
+                break
+            return self._normalize_playlist_url(current_url)
         except Exception as e:
             self.logger.warning('Shortener resolution failed for %s: %s' % (url, repr(e)))
 
